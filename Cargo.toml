@@ -1,0 +1,18 @@
+[package]
+name = "vhost-user-blk"
+version = "0.1.0"
+authors = ["Sergio Lopez <slp@redhat.com>"]
+description = "Rust implementation of the vhost-user-blk personality"
+edition = "2018"
+license = "Apache-2.0"
+
+[dependencies]
+env_logger = "0.5.12"
+epoll = ">=4.0.1"
+libc = ">=0.2.39"
+log = "0.4.6"
+nix = ">=0.12"
+
+virtio-bindings = { git = "https://github.com/slp/virtio-bindings", features = [ "virtio-v5_0_0" ] }
+vhostuser_rs = { git ="https://github.com/slp/vhostuser_rs" }
+vm-memory = { git = "https://github.com/rust-vmm/vm-memory", features = [ "backend-mmap" ] }
