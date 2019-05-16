@@ -7,8 +7,10 @@
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 
 use crate::backend::StorageBackend;
+use nix::sys::uio;
 use virtio_bindings::bindings::virtio_blk::{virtio_blk_config, VIRTIO_BLK_ID_BYTES};
 
 const SECTOR_SHIFT: u8 = 9;
@@ -31,6 +33,7 @@ pub fn build_device_id(image: &File) -> Result<String> {
 pub struct StorageBackendRaw {
     image: File,
     image_id: Vec<u8>,
+    position: u64,
     config: virtio_blk_config,
 }
 
@@ -59,6 +62,7 @@ impl StorageBackendRaw {
         Ok(StorageBackendRaw {
             image,
             image_id,
+            position: 0u64,
             config,
         })
     }
@@ -66,19 +70,28 @@ impl StorageBackendRaw {
 
 impl Read for StorageBackendRaw {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.image.read(buf)
+        uio::pread(self.image.as_raw_fd(), buf, self.position as i64)
+            .map_err(|err| Error::new(ErrorKind::Other, err))
     }
 }
 
 impl Seek for StorageBackendRaw {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-        self.image.seek(pos)
+        match pos {
+            SeekFrom::Start(offset) => self.position = offset as u64,
+            SeekFrom::Current(offset) => self.position += offset as u64,
+            SeekFrom::End(offset) => {
+                self.position = (self.config.capacity << SECTOR_SHIFT) + (offset as u64)
+            }
+        }
+        Ok(self.position)
     }
 }
 
 impl Write for StorageBackendRaw {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.image.write(buf)
+        uio::pwrite(self.image.as_raw_fd(), buf, self.position as i64)
+            .map_err(|err| Error::new(ErrorKind::Other, err))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -91,6 +104,7 @@ impl Clone for StorageBackendRaw {
         StorageBackendRaw {
             image: self.image.try_clone().unwrap(),
             image_id: self.image_id.clone(),
+            position: self.position,
             config: self.config.clone(),
         }
     }
