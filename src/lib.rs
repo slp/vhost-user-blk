@@ -6,7 +6,7 @@ pub mod backend_raw;
 pub mod block;
 pub mod eventfd;
 pub mod message;
-pub mod queue;
+pub mod vring;
 
 #[cfg(test)]
 mod tests {
