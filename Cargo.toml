@@ -14,4 +14,5 @@ log = "0.4.6"
 nix = ">=0.12"
 
 virtio-bindings = { git = "https://github.com/slp/virtio-bindings", features = [ "virtio-v5_0_0" ] }
-vhostuser_rs = { git ="https://github.com/slp/vhostuser_rs" }
+vhostuser_rs = { git = "https://github.com/slp/vhostuser_rs" }
+vm-memory = { path = "../vm-memory", features = [ "backend-mmap"] }

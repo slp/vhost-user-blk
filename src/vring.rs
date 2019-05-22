@@ -17,14 +17,20 @@ use log::{debug, error};
 use vhostuser_rs::{Error, Result};
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_bindings::bindings::virtio_ring::*;
+//use vm_memory::bytes::Bytes;
+use vm_memory::guest_memory;
+use vm_memory::{
+    ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionMmap, MemoryRegionAddress, MmapRegion,
+};
 
 #[derive(Debug)]
 enum ExecuteError {
     BadRequest(Error),
     Flush(io::Error),
-    Read(io::Error),
+    Read(guest_memory::Error),
     Seek(io::Error),
-    Write(io::Error),
+    Write(guest_memory::Error),
     Unsupported(u32),
 }
 
@@ -50,10 +56,12 @@ enum RequestType {
     Unsupported(u32),
 }
 
-fn request_type(mmap_addr: u64, desc_addr: u64) -> result::Result<RequestType, Error> {
-    let addr = mmap_addr + desc_addr;
-    let type_ = unsafe { &*(addr as *const u32) };
-    match *type_ {
+fn request_type(
+    region: &GuestRegionMmap,
+    addr: MemoryRegionAddress,
+) -> result::Result<RequestType, Error> {
+    let type_: u32 = region.read_obj(addr).unwrap();
+    match type_ {
         VIRTIO_BLK_T_IN => {
             debug!("VIRTIO_BLK_T_IN");
             Ok(RequestType::In)
@@ -77,10 +85,10 @@ fn request_type(mmap_addr: u64, desc_addr: u64) -> result::Result<RequestType, E
     }
 }
 
-fn sector(mmap_addr: u64, desc_addr: u64) -> result::Result<u64, Error> {
-    let addr = mmap_addr + desc_addr + 8;
-    let sector = unsafe { &*(addr as *const u64) };
-    Ok(*sector)
+fn sector(region: &GuestRegionMmap, addr: MemoryRegionAddress) -> result::Result<u64, Error> {
+    let sector_addr = region.checked_offset(addr, 8).unwrap();
+    let sector: u64 = region.read_obj(sector_addr).unwrap();
+    Ok(sector)
 }
 
 #[derive(Debug)]
@@ -94,7 +102,11 @@ struct Request {
 
 impl Request {
     #[allow(clippy::ptr_arg)]
-    fn execute<T: StorageBackend>(&self, disk: &mut T) -> result::Result<u32, ExecuteError> {
+    fn execute<T: StorageBackend>(
+        &self,
+        memory: &GuestMemoryMmap,
+        disk: &mut T,
+    ) -> result::Result<u32, ExecuteError> {
         disk.check_sector_offset(self.sector, self.data_len.into())
             .map_err(|err| {
                 debug!("check_sector_offset {:?}", err);
@@ -105,8 +117,7 @@ impl Request {
             ExecuteError::Seek(err)
         })?;
 
-        let data_buf =
-            unsafe { slice::from_raw_parts_mut(self.data_addr as *mut u8, self.data_len as usize) };
+        let (region, addr) = memory.to_region_addr(GuestAddress(self.data_addr)).unwrap();
 
         match self.request_type {
             RequestType::In => {
@@ -114,7 +125,7 @@ impl Request {
                     "reading {} bytes starting at sector {}",
                     self.data_len, self.sector
                 );
-                match disk.read_exact(data_buf) {
+                match region.read_from(addr, disk, self.data_len as usize) {
                     Ok(_) => return Ok(self.data_len),
                     Err(err) => {
                         error!("error reading from disk: {:?}", err);
@@ -127,7 +138,7 @@ impl Request {
                     "writing out {} bytes starting on sector {}",
                     self.data_len, self.sector
                 );
-                match disk.write_all(data_buf) {
+                match region.write_to(addr, disk, self.data_len as usize) {
                     Ok(_) => (),
                     Err(err) => {
                         error!("error writing to disk: {:?}", err);
@@ -147,7 +158,6 @@ impl Request {
             }
             RequestType::GetDeviceID => {
                 debug!("providing device ID data");
-                /*
                 let image_id = disk.get_image_id();
                 if (self.data_len as usize) < image_id.len() {
                     error!("data len smaller than disk_id");
@@ -160,7 +170,6 @@ impl Request {
                         return Err(ExecuteError::Write(err));
                     }
                 }
-                 */
             }
             RequestType::Unsupported(t) => {
                 error!("unsupported request");
@@ -169,6 +178,37 @@ impl Request {
         };
         Ok(0)
     }
+}
+
+#[derive(Default, Clone, Copy)]
+struct VringUsedPartial {
+    flags: u16,
+    idx: u16,
+    // ring deliberately omitted
+}
+
+#[derive(Default, Clone, Copy)]
+struct VringAvailPartial {
+    flags: u16,
+    idx: u16,
+    // ring deliberately omitted
+}
+
+#[derive(Default, Clone, Copy)]
+struct VringDesc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+unsafe impl ByteValued for VringUsedPartial {}
+unsafe impl ByteValued for VringAvailPartial {}
+unsafe impl ByteValued for VringDesc {}
+
+struct VringAddress {
+    guest_addr: GuestAddress,
+    region_addr: MemoryRegionAddress,
 }
 
 pub struct VringMmapRegion {
@@ -183,12 +223,9 @@ impl VringMmapRegion {
 }
 
 pub struct VringMemTable {
-    desc_region: VringMmapRegion,
-    desc_addr: u64,
-    used_region: VringMmapRegion,
-    used_addr: u64,
-    avail_region: VringMmapRegion,
-    avail_addr: u64,
+    desc: VringAddress,
+    used: VringAddress,
+    avail: VringAddress,
 }
 
 pub enum VringFd {
@@ -198,6 +235,7 @@ pub enum VringFd {
 }
 
 pub struct Vring<S: StorageBackend> {
+    memory: GuestMemoryMmap,
     backend: S,
 
     mem_table: Option<VringMemTable>,
@@ -214,8 +252,9 @@ pub struct Vring<S: StorageBackend> {
 }
 
 impl<S: StorageBackend> Vring<S> {
-    pub fn new(backend: S) -> Self {
+    pub fn new(memory: GuestMemoryMmap, backend: S) -> Self {
         Vring {
+            memory,
             backend,
             mem_table: None,
             shadow_avail_idx: 0,
@@ -248,24 +287,39 @@ impl<S: StorageBackend> Vring<S> {
 
     pub fn set_mem_table(
         &mut self,
-        desc_region: VringMmapRegion,
-        desc_addr: u64,
-        used_region: VringMmapRegion,
-        used_addr: u64,
-        avail_region: VringMmapRegion,
-        avail_addr: u64,
+        desc_addr: GuestAddress,
+        used_addr: GuestAddress,
+        avail_addr: GuestAddress,
     ) -> Result<()> {
-        // TODO - check offsets
+        let (_desc_region, desc_region_addr) = self
+            .memory
+            .to_region_addr(desc_addr)
+            .ok_or(Error::InvalidParam)?;
+        let (used_region, used_region_addr) = self
+            .memory
+            .to_region_addr(used_addr)
+            .ok_or(Error::InvalidParam)?;
+        let (_avail_region, avail_region_addr) = self
+            .memory
+            .to_region_addr(avail_addr)
+            .ok_or(Error::InvalidParam)?;
+
         self.mem_table = Some(VringMemTable {
-            desc_region,
-            desc_addr,
-            used_region,
-            used_addr,
-            avail_region,
-            avail_addr,
+            desc: VringAddress {
+                guest_addr: desc_addr,
+                region_addr: desc_region_addr,
+            },
+            used: VringAddress {
+                guest_addr: used_addr,
+                region_addr: used_region_addr,
+            },
+            avail: VringAddress {
+                guest_addr: avail_addr,
+                region_addr: avail_region_addr,
+            },
         });
 
-        let used = unsafe { &mut *(used_addr as *mut vring_used) };
+        let used: VringUsedPartial = used_region.read_obj(used_region_addr).unwrap();
         self.next_used = Wrapping(used.idx);
         Ok(())
     }
@@ -308,7 +362,8 @@ impl<S: StorageBackend> Vring<S> {
 
     fn get_avail_idx(&mut self) -> u16 {
         let mem_table = self.mem_table.as_ref().unwrap();
-        let avail = unsafe { &*(mem_table.avail_addr as *const vring_avail) };
+        let region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
+        let avail: VringAvailPartial = region.read_obj(mem_table.avail.region_addr).unwrap();
         self.shadow_avail_idx = avail.idx;
         self.shadow_avail_idx
     }
@@ -323,21 +378,30 @@ impl<S: StorageBackend> Vring<S> {
 
     fn get_head_desc_idx(&self, idx: u16) -> u16 {
         let mem_table = self.mem_table.as_ref().unwrap();
-        let head_offset = (2 * (idx % self.size)) as u64;
-        let head_addr = mem_table.avail_addr + 4 + head_offset;
-        let head_desc_idx = unsafe { &*(head_addr as *const u16) };
+        let avail_region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
+        let head_offset = mem::size_of::<VringAvailPartial>()
+            + (mem::size_of::<u16>() * (idx % self.size) as usize);
+        let head_addr = avail_region
+            .checked_offset(mem_table.avail.region_addr, head_offset)
+            .unwrap();
+        let head_desc_idx: u16 = avail_region.read_obj(head_addr).unwrap();
 
-        if *head_desc_idx > self.size {
+        if head_desc_idx > self.size {
             panic!("bogus head descriptor index");
         }
 
-        *head_desc_idx
+        head_desc_idx
     }
 
-    fn get_desc(&self, idx: u16) -> &vring_desc {
-        // TODO - check that descriptor address is within the region
+    fn get_desc(&self, idx: u16) -> VringDesc {
         let mem_table = self.mem_table.as_ref().unwrap();
-        unsafe { &*((mem_table.desc_addr + 16 * (idx as u64)) as *const vring_desc) }
+        let desc_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
+        let desc_offset = mem::size_of::<vring_desc>() * (idx as usize);
+        let desc_addr = desc_region
+            .checked_offset(mem_table.desc.region_addr, desc_offset)
+            .unwrap();
+        let desc: VringDesc = desc_region.read_obj(desc_addr).unwrap();
+        desc
     }
 
     fn get_next_request(&mut self) -> Result<(Request, u16)> {
@@ -346,9 +410,14 @@ impl<S: StorageBackend> Vring<S> {
         self.last_avail_idx += Wrapping(1);
         let head_desc = self.get_desc(head_desc_idx).clone();
 
+        let (desc_region, desc_region_addr) = self
+            .memory
+            .to_region_addr(GuestAddress(head_desc.addr))
+            .unwrap();
+
         let mut req = Request {
-            request_type: request_type(mem_table.desc_region.mmap_addr, head_desc.addr).unwrap(),
-            sector: sector(mem_table.desc_region.mmap_addr, head_desc.addr).unwrap(),
+            request_type: request_type(desc_region, desc_region_addr).unwrap(),
+            sector: sector(desc_region, desc_region_addr).unwrap(),
             data_addr: 0,
             data_len: 0,
             status_addr: 0,
@@ -370,11 +439,11 @@ impl<S: StorageBackend> Vring<S> {
             data_desc = desc;
             status_desc = self.get_desc(data_desc.next);
 
-            req.data_addr = mem_table.desc_region.mmap_addr + data_desc.addr;
+            req.data_addr = data_desc.addr;
             req.data_len = data_desc.len;
         }
 
-        req.status_addr = mem_table.desc_region.mmap_addr + status_desc.addr;
+        req.status_addr = status_desc.addr;
         Ok((req, head_desc_idx))
     }
 
@@ -384,22 +453,36 @@ impl<S: StorageBackend> Vring<S> {
             desc_index, len, self.next_used.0
         );
         let mem_table = self.mem_table.as_ref().unwrap();
-        let next_used = self.next_used.0 % self.size;
-        let mut addr = mem_table.used_addr + 4 + (next_used as u64) * 8;
+        let used_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
+        let next_used = (self.next_used.0 % self.size) as usize;
 
-        let used_elem_idx = unsafe { &mut *(addr as *mut u32) };
-        *used_elem_idx = desc_index as u32;
-        addr += 4;
-        let used_elem_len = unsafe { &mut *(addr as *mut u32) };
-        *used_elem_len = len;
+        let used_elem_offset =
+            mem::size_of::<VringUsedPartial>() + next_used * mem::size_of::<vring_used_elem>();
+        let used_elem_idx_addr = used_region
+            .checked_offset(mem_table.used.region_addr, used_elem_offset)
+            .unwrap();
+        used_region
+            .write_obj(desc_index as u32, used_elem_idx_addr)
+            .unwrap();
+
+        let used_elem_len_addr = used_region
+            .checked_offset(
+                mem_table.used.region_addr,
+                used_elem_offset + mem::size_of::<u32>(),
+            )
+            .unwrap();
+        used_region.write_obj(len, used_elem_len_addr).unwrap();
 
         self.next_used += Wrapping(1);
 
         fence(Ordering::Release);
 
-        let addr = mem_table.used_addr + 2;
-        let used_idx = unsafe { &mut *(addr as *mut u16) };
-        *used_idx = self.next_used.0;
+        let used_idx_addr = used_region
+            .checked_offset(mem_table.used.region_addr, mem::size_of::<u16>())
+            .unwrap();
+        used_region
+            .write_obj(self.next_used.0, used_idx_addr)
+            .unwrap();
     }
 
     pub fn process_queue(&mut self) -> Result<bool> {
@@ -418,7 +501,7 @@ impl<S: StorageBackend> Vring<S> {
                 Ok((request, index)) => {
                     debug!("element is a valid request");
 
-                    let status = match request.execute(&mut self.backend) {
+                    let status = match request.execute(&self.memory, &mut self.backend) {
                         Ok(l) => {
                             len = l;
                             VIRTIO_BLK_S_OK
@@ -429,10 +512,13 @@ impl<S: StorageBackend> Vring<S> {
                             err.status()
                         }
                     };
-                    let status_mem = unsafe { &mut *(request.status_addr as *mut u32) };
-                    *status_mem = status;
-                    //let (region, addr) = self.mem.to_region_addr(request.status_addr).unwrap();
-                    //region.write_obj(status, addr).unwrap();
+                    //let status_mem = unsafe { &mut *(request.status_addr as *mut u32) };
+                    //*status_mem = status;
+                    let (region, addr) = self
+                        .memory
+                        .to_region_addr(GuestAddress(request.status_addr))
+                        .unwrap();
+                    region.write_obj(status, addr).unwrap();
                     used_desc_heads[used_count] = (index, len);
                     used_count += 1;
                 }

@@ -24,10 +24,15 @@ use crate::vring::{Vring, VringFd, VringMmapRegion};
 use libc;
 use log::{debug, error};
 use virtio_bindings::bindings::virtio_blk::*;
+use vm_memory::{
+    Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionMmap, MmapRegion,
+};
 
 use vhostuser_rs::message::*;
 use vhostuser_rs::{Error, Result, VhostUserSlave};
 
+/*
 pub struct VhostMmapRegion {
     mmap_addr: u64,
     guest_phys_addr: u64,
@@ -53,12 +58,14 @@ impl VhostMmapRegion {
         Ok(self.mmap_addr + (addr - self.qemu_virt_addr))
     }
 }
+*/
 
 pub struct VhostUserBlk<S: StorageBackend> {
     backend: S,
     main_eventfd: EventFd,
     main_sender: Sender<VubMessage>,
-    mmap_regions: Vec<VhostMmapRegion>,
+    memory: Option<GuestMemoryMmap>,
+    memory_regions: Vec<VhostUserMemoryRegion>,
     vring_num: usize,
     vrings: HashMap<usize, Arc<Mutex<Vring<S>>>>,
     vring_default_enabled: bool,
@@ -79,7 +86,8 @@ impl<S: StorageBackend> VhostUserBlk<S> {
             backend,
             main_eventfd,
             main_sender,
-            mmap_regions: vec![],
+            memory: None,
+            memory_regions: vec![],
             vring_num,
             vrings: HashMap::new(),
             vring_default_enabled: false,
@@ -99,9 +107,9 @@ impl<S: StorageBackend> VhostUserBlk<S> {
         Ok(vring.clone())
     }
 
-    fn find_region(&self, addr: u64) -> Result<&VhostMmapRegion> {
-        for region in &self.mmap_regions {
-            if addr >= region.qemu_virt_addr && addr <= region.qemu_virt_addr + region.memory_size {
+    fn find_region(&self, addr: u64) -> Result<&VhostUserMemoryRegion> {
+        for region in &self.memory_regions {
+            if addr >= region.userspace_addr && addr <= region.userspace_addr + region.memory_size {
                 return Ok(region);
             }
         }
@@ -178,37 +186,40 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
 
     fn set_mem_table(&mut self, regions: &[VhostUserMemoryRegion], fds: &[RawFd]) -> Result<()> {
         let mut i = 0;
+        let mut guest_regions: Vec<GuestRegionMmap> = vec![];
 
         // TODO - clean up vrings
         // Reset the current memory_regions array
-        self.mmap_regions = vec![];
+        self.memory_regions = vec![];
 
         for region in regions.iter() {
             let file = unsafe { File::from_raw_fd(fds[i]) };
-            let addr = unsafe {
-                libc::mmap(
-                    null_mut(),
-                    region.memory_size as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    file.as_raw_fd(),
-                    region.mmap_offset as i64,
-                )
-            };
+            let mmap = MmapRegion::from_fd(
+                &file,
+                region.memory_size as usize,
+                region.mmap_offset as i64,
+            )
+            .map_err(|_err| Error::OperationFailedInSlave)?;
 
-            if addr == libc::MAP_FAILED {
-                error!("error in mmap");
-                return Err(Error::OperationFailedInSlave);
-            }
+            guest_regions.push(GuestRegionMmap::new(
+                mmap,
+                GuestAddress(region.guest_phys_addr),
+            ));
 
-            self.mmap_regions.push(VhostMmapRegion::new(
-                addr as u64,
+            self.memory_regions.push(VhostUserMemoryRegion::new(
                 region.guest_phys_addr,
                 region.memory_size,
                 region.userspace_addr,
+                region.mmap_offset,
             ));
+
             i += 1;
         }
+
+        self.memory = Some(
+            GuestMemoryMmap::from_regions(guest_regions)
+                .map_err(|_err| Error::OperationFailedInSlave)?,
+        );
 
         Ok(())
     }
@@ -220,11 +231,15 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
     fn set_vring_num(&mut self, index: u32, num: u32) -> Result<()> {
         let vring_index: usize = index as usize;
         let size: u16 = u16::try_from(num).map_err(|_err| Error::InvalidParam)?;
-        if !self.vrings.contains_key(&vring_index) {
-            self.vrings.insert(
-                vring_index,
-                Arc::new(Mutex::new(Vring::new(self.backend.clone()))),
-            );
+        if let Some(mem) = self.memory.as_ref() {
+            if !self.vrings.contains_key(&vring_index) {
+                self.vrings.insert(
+                    vring_index,
+                    Arc::new(Mutex::new(Vring::new(mem.clone(), self.backend.clone()))),
+                );
+            }
+        } else {
+            return Err(Error::InvalidOperation);
         }
 
         let vring_mtx = self.vrings.get(&vring_index).unwrap();
@@ -245,17 +260,14 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         _log: u64,
     ) -> Result<()> {
         debug!("SET_VRING_ADDR");
-        let region = self.find_region(descriptor)?;
-        let desc_region = VringMmapRegion::new(region.mmap_addr, region.memory_size);
-        let desc_addr = region.qva_to_va(descriptor)?;
+        let desc_region = self.find_region(descriptor)?;
+        let desc_addr = GuestAddress(descriptor - desc_region.userspace_addr);
 
-        let region = self.find_region(used)?;
-        let used_region = VringMmapRegion::new(region.mmap_addr, region.memory_size);
-        let used_addr = region.qva_to_va(used)?;
+        let used_region = self.find_region(used)?;
+        let used_addr = GuestAddress(used - used_region.userspace_addr);
 
-        let region = self.find_region(available)?;
-        let avail_region = VringMmapRegion::new(region.mmap_addr, region.memory_size);
-        let avail_addr = region.qva_to_va(available)?;
+        let avail_region = self.find_region(available)?;
+        let avail_addr = GuestAddress(available - avail_region.userspace_addr);
 
         let vring_index: usize = index as usize;
         let vring = match self.vrings.get_mut(&vring_index) {
@@ -263,14 +275,10 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
             None => return Err(Error::InvalidParam),
         };
 
-        vring.lock().unwrap().set_mem_table(
-            desc_region,
-            desc_addr,
-            used_region,
-            used_addr,
-            avail_region,
-            avail_addr,
-        )?;
+        vring
+            .lock()
+            .unwrap()
+            .set_mem_table(desc_addr, used_addr, avail_addr)?;
 
         Ok(())
     }
