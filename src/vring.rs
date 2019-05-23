@@ -11,6 +11,7 @@ use std::os::unix::io::RawFd;
 use std::result;
 use std::slice;
 use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
 
 use crate::backend::StorageBackend;
 use log::{debug, error};
@@ -207,8 +208,8 @@ unsafe impl ByteValued for VringAvailPartial {}
 unsafe impl ByteValued for VringDesc {}
 
 struct VringAddress {
-    guest_addr: GuestAddress,
-    region_addr: MemoryRegionAddress,
+    region: Arc<GuestRegionMmap>,
+    addr: MemoryRegionAddress,
 }
 
 pub struct VringMmapRegion {
@@ -291,36 +292,46 @@ impl<S: StorageBackend> Vring<S> {
         used_addr: GuestAddress,
         avail_addr: GuestAddress,
     ) -> Result<()> {
-        let (_desc_region, desc_region_addr) = self
+        let desc_region = self
             .memory
+            .find_and_clone_region(desc_addr)
+            .ok_or(Error::InvalidParam)?;
+        let desc_region_addr = desc_region
             .to_region_addr(desc_addr)
             .ok_or(Error::InvalidParam)?;
-        let (used_region, used_region_addr) = self
+        let used_region = self
             .memory
+            .find_and_clone_region(used_addr)
+            .ok_or(Error::InvalidParam)?;
+        let used_region_addr = used_region
             .to_region_addr(used_addr)
             .ok_or(Error::InvalidParam)?;
-        let (_avail_region, avail_region_addr) = self
+        let avail_region = self
             .memory
+            .find_and_clone_region(avail_addr)
+            .ok_or(Error::InvalidParam)?;
+        let avail_region_addr = avail_region
             .to_region_addr(avail_addr)
             .ok_or(Error::InvalidParam)?;
 
+        let used: VringUsedPartial = used_region.read_obj(used_region_addr).unwrap();
+        self.next_used = Wrapping(used.idx);
+
         self.mem_table = Some(VringMemTable {
             desc: VringAddress {
-                guest_addr: desc_addr,
-                region_addr: desc_region_addr,
+                region: desc_region,
+                addr: desc_region_addr,
             },
             used: VringAddress {
-                guest_addr: used_addr,
-                region_addr: used_region_addr,
+                region: used_region,
+                addr: used_region_addr,
             },
             avail: VringAddress {
-                guest_addr: avail_addr,
-                region_addr: avail_region_addr,
+                region: avail_region,
+                addr: avail_region_addr,
             },
         });
 
-        let used: VringUsedPartial = used_region.read_obj(used_region_addr).unwrap();
-        self.next_used = Wrapping(used.idx);
         Ok(())
     }
 
@@ -362,8 +373,12 @@ impl<S: StorageBackend> Vring<S> {
 
     fn get_avail_idx(&mut self) -> u16 {
         let mem_table = self.mem_table.as_ref().unwrap();
-        let region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
-        let avail: VringAvailPartial = region.read_obj(mem_table.avail.region_addr).unwrap();
+        //let region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
+        let avail: VringAvailPartial = mem_table
+            .avail
+            .region
+            .read_obj(mem_table.avail.addr)
+            .unwrap();
         self.shadow_avail_idx = avail.idx;
         self.shadow_avail_idx
     }
@@ -378,13 +393,15 @@ impl<S: StorageBackend> Vring<S> {
 
     fn get_head_desc_idx(&self, idx: u16) -> u16 {
         let mem_table = self.mem_table.as_ref().unwrap();
-        let avail_region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
+        //let avail_region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
         let head_offset = mem::size_of::<VringAvailPartial>()
             + (mem::size_of::<u16>() * (idx % self.size) as usize);
-        let head_addr = avail_region
-            .checked_offset(mem_table.avail.region_addr, head_offset)
+        let head_addr = mem_table
+            .avail
+            .region
+            .checked_offset(mem_table.avail.addr, head_offset)
             .unwrap();
-        let head_desc_idx: u16 = avail_region.read_obj(head_addr).unwrap();
+        let head_desc_idx: u16 = mem_table.avail.region.read_obj(head_addr).unwrap();
 
         if head_desc_idx > self.size {
             panic!("bogus head descriptor index");
@@ -395,12 +412,14 @@ impl<S: StorageBackend> Vring<S> {
 
     fn get_desc(&self, idx: u16) -> VringDesc {
         let mem_table = self.mem_table.as_ref().unwrap();
-        let desc_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
+        //let desc_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
         let desc_offset = mem::size_of::<vring_desc>() * (idx as usize);
-        let desc_addr = desc_region
-            .checked_offset(mem_table.desc.region_addr, desc_offset)
+        let desc_addr = mem_table
+            .desc
+            .region
+            .checked_offset(mem_table.desc.addr, desc_offset)
             .unwrap();
-        let desc: VringDesc = desc_region.read_obj(desc_addr).unwrap();
+        let desc: VringDesc = mem_table.desc.region.read_obj(desc_addr).unwrap();
         desc
     }
 
@@ -453,34 +472,48 @@ impl<S: StorageBackend> Vring<S> {
             desc_index, len, self.next_used.0
         );
         let mem_table = self.mem_table.as_ref().unwrap();
-        let used_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
+        //let used_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
         let next_used = (self.next_used.0 % self.size) as usize;
 
         let used_elem_offset =
             mem::size_of::<VringUsedPartial>() + next_used * mem::size_of::<vring_used_elem>();
-        let used_elem_idx_addr = used_region
-            .checked_offset(mem_table.used.region_addr, used_elem_offset)
+        let used_elem_idx_addr = mem_table
+            .used
+            .region
+            .checked_offset(mem_table.used.addr, used_elem_offset)
             .unwrap();
-        used_region
+        mem_table
+            .used
+            .region
             .write_obj(desc_index as u32, used_elem_idx_addr)
             .unwrap();
 
-        let used_elem_len_addr = used_region
+        let used_elem_len_addr = mem_table
+            .used
+            .region
             .checked_offset(
-                mem_table.used.region_addr,
+                mem_table.used.addr,
                 used_elem_offset + mem::size_of::<u32>(),
             )
             .unwrap();
-        used_region.write_obj(len, used_elem_len_addr).unwrap();
+        mem_table
+            .used
+            .region
+            .write_obj(len, used_elem_len_addr)
+            .unwrap();
 
         self.next_used += Wrapping(1);
 
         fence(Ordering::Release);
 
-        let used_idx_addr = used_region
-            .checked_offset(mem_table.used.region_addr, mem::size_of::<u16>())
+        let used_idx_addr = mem_table
+            .used
+            .region
+            .checked_offset(mem_table.used.addr, mem::size_of::<u16>())
             .unwrap();
-        used_region
+        mem_table
+            .used
+            .region
             .write_obj(self.next_used.0, used_idx_addr)
             .unwrap();
     }

@@ -186,7 +186,7 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
 
     fn set_mem_table(&mut self, regions: &[VhostUserMemoryRegion], fds: &[RawFd]) -> Result<()> {
         let mut i = 0;
-        let mut guest_regions: Vec<GuestRegionMmap> = vec![];
+        let mut guest_regions: Vec<Arc<GuestRegionMmap>> = vec![];
 
         // TODO - clean up vrings
         // Reset the current memory_regions array
@@ -201,10 +201,10 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
             )
             .map_err(|_err| Error::OperationFailedInSlave)?;
 
-            guest_regions.push(GuestRegionMmap::new(
+            guest_regions.push(Arc::new(GuestRegionMmap::new(
                 mmap,
                 GuestAddress(region.guest_phys_addr),
-            ));
+            )));
 
             self.memory_regions.push(VhostUserMemoryRegion::new(
                 region.guest_phys_addr,
