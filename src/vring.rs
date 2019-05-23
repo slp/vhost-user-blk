@@ -21,7 +21,7 @@ use virtio_bindings::bindings::virtio_ring::*;
 //use vm_memory::bytes::Bytes;
 use vm_memory::guest_memory;
 use vm_memory::{
-    ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
     GuestRegionMmap, MemoryRegionAddress, MmapRegion,
 };
 
@@ -212,6 +212,12 @@ struct VringAddress {
     addr: MemoryRegionAddress,
 }
 
+struct VringUsedRegion {
+    region: Arc<GuestRegionMmap>,
+    base: MemoryRegionAddress,
+    idx: MemoryRegionAddress,
+}
+
 pub struct VringMmapRegion {
     mmap_addr: u64,
     size: u64,
@@ -225,7 +231,7 @@ impl VringMmapRegion {
 
 pub struct VringMemTable {
     desc: VringAddress,
-    used: VringAddress,
+    used: VringUsedRegion,
     avail: VringAddress,
 }
 
@@ -306,6 +312,9 @@ impl<S: StorageBackend> Vring<S> {
         let used_region_addr = used_region
             .to_region_addr(used_addr)
             .ok_or(Error::InvalidParam)?;
+        let used_idx_addr = used_region
+            .checked_offset(used_region_addr, mem::size_of::<u16>())
+            .ok_or(Error::InvalidParam)?;
         let avail_region = self
             .memory
             .find_and_clone_region(avail_addr)
@@ -317,14 +326,16 @@ impl<S: StorageBackend> Vring<S> {
         let used: VringUsedPartial = used_region.read_obj(used_region_addr).unwrap();
         self.next_used = Wrapping(used.idx);
 
+        // TODO - Check region offsets with vring size
         self.mem_table = Some(VringMemTable {
             desc: VringAddress {
                 region: desc_region,
                 addr: desc_region_addr,
             },
-            used: VringAddress {
+            used: VringUsedRegion {
                 region: used_region,
-                addr: used_region_addr,
+                base: used_region_addr,
+                idx: used_idx_addr,
             },
             avail: VringAddress {
                 region: avail_region,
@@ -396,11 +407,7 @@ impl<S: StorageBackend> Vring<S> {
         //let avail_region = self.memory.find_region(mem_table.avail.guest_addr).unwrap();
         let head_offset = mem::size_of::<VringAvailPartial>()
             + (mem::size_of::<u16>() * (idx % self.size) as usize);
-        let head_addr = mem_table
-            .avail
-            .region
-            .checked_offset(mem_table.avail.addr, head_offset)
-            .unwrap();
+        let head_addr = mem_table.avail.addr.unchecked_add(head_offset as u64);
         let head_desc_idx: u16 = mem_table.avail.region.read_obj(head_addr).unwrap();
 
         if head_desc_idx > self.size {
@@ -414,11 +421,7 @@ impl<S: StorageBackend> Vring<S> {
         let mem_table = self.mem_table.as_ref().unwrap();
         //let desc_region = self.memory.find_region(mem_table.used.guest_addr).unwrap();
         let desc_offset = mem::size_of::<vring_desc>() * (idx as usize);
-        let desc_addr = mem_table
-            .desc
-            .region
-            .checked_offset(mem_table.desc.addr, desc_offset)
-            .unwrap();
+        let desc_addr = mem_table.desc.addr.unchecked_add(desc_offset as u64);
         let desc: VringDesc = mem_table.desc.region.read_obj(desc_addr).unwrap();
         desc
     }
@@ -477,24 +480,16 @@ impl<S: StorageBackend> Vring<S> {
 
         let used_elem_offset =
             mem::size_of::<VringUsedPartial>() + next_used * mem::size_of::<vring_used_elem>();
-        let used_elem_idx_addr = mem_table
+        let used_elem_idx_addr = mem_table.used.base.unchecked_add(used_elem_offset as u64);
+        let used_elem_len_addr = mem_table
             .used
-            .region
-            .checked_offset(mem_table.used.addr, used_elem_offset)
-            .unwrap();
+            .base
+            .unchecked_add((used_elem_offset + mem::size_of::<u32>()) as u64);
+
         mem_table
             .used
             .region
             .write_obj(desc_index as u32, used_elem_idx_addr)
-            .unwrap();
-
-        let used_elem_len_addr = mem_table
-            .used
-            .region
-            .checked_offset(
-                mem_table.used.addr,
-                used_elem_offset + mem::size_of::<u32>(),
-            )
             .unwrap();
         mem_table
             .used
@@ -506,15 +501,10 @@ impl<S: StorageBackend> Vring<S> {
 
         fence(Ordering::Release);
 
-        let used_idx_addr = mem_table
-            .used
-            .region
-            .checked_offset(mem_table.used.addr, mem::size_of::<u16>())
-            .unwrap();
         mem_table
             .used
             .region
-            .write_obj(self.next_used.0, used_idx_addr)
+            .write_obj(self.next_used.0, mem_table.used.idx)
             .unwrap();
     }
 
