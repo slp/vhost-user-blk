@@ -1,8 +1,9 @@
 // Copyright (C) 2019 Red Hat, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-mod backend;
+pub mod backend;
 pub mod backend_raw;
+pub mod backend_raw_async;
 pub mod block;
 pub mod eventfd;
 pub mod message;

@@ -15,6 +15,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::result;
 use std::slice;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use crate::backend::StorageBackend;
 use crate::eventfd::EventFd;
@@ -99,12 +100,18 @@ fn sector(mem: &GuestMemoryMmap, desc_addr: GuestAddress) -> result::Result<u64,
     Ok(region.read_obj(addr).unwrap())
 }
 
+enum ExecuteType {
+    Sync(u32),
+    Async(u32),
+}
+
 struct Request {
     request_type: RequestType,
     sector: u64,
     data_addr: GuestAddress,
     data_len: u32,
     status_addr: GuestAddress,
+    desc_index: u16,
 }
 
 impl Request {
@@ -123,6 +130,7 @@ impl Request {
             data_addr: GuestAddress(0),
             data_len: 0,
             status_addr: GuestAddress(0),
+            desc_index: avail_desc.index,
         };
 
         let data_desc;
@@ -169,6 +177,7 @@ impl Request {
         }
 
         req.status_addr = status_desc.addr;
+
         Ok(req)
     }
 
@@ -177,7 +186,7 @@ impl Request {
         &self,
         disk: &mut T,
         mem: &GuestMemoryMmap,
-    ) -> result::Result<u32, ExecuteError> {
+    ) -> result::Result<ExecuteType, ExecuteError> {
         disk.check_sector_offset(self.sector, self.data_len.into())
             .map_err(|err| {
                 debug!("check_sector_offset {:?}", err);
@@ -197,10 +206,16 @@ impl Request {
                     self.data_len, self.sector
                 );
                 match region.read_from(addr, disk, self.data_len as usize) {
-                    Ok(_) => return Ok(self.data_len),
+                    Ok(_) => {
+                        if disk.is_sync() {
+                            Ok(ExecuteType::Sync(self.data_len))
+                        } else {
+                            Ok(ExecuteType::Async(disk.get_last_cookie()))
+                        }
+                    }
                     Err(err) => {
                         error!("error reading from disk: {:?}", err);
-                        return Err(ExecuteError::Read(err));
+                        Err(ExecuteError::Read(err))
                     }
                 }
             }
@@ -210,20 +225,26 @@ impl Request {
                     self.data_len, self.sector
                 );
                 match region.write_to(addr, disk, self.data_len as usize) {
-                    Ok(_) => (),
+                    Ok(_) => {
+                        if disk.is_sync() {
+                            Ok(ExecuteType::Sync(self.data_len))
+                        } else {
+                            Ok(ExecuteType::Async(disk.get_last_cookie()))
+                        }
+                    }
                     Err(err) => {
                         error!("error writing to disk: {:?}", err);
-                        return Err(ExecuteError::Write(err));
+                        Err(ExecuteError::Write(err))
                     }
                 }
             }
             RequestType::Flush => {
                 debug!("requesting backend to flush out disk buffers");
                 match disk.flush() {
-                    Ok(_) => return Ok(0),
+                    Ok(_) => Ok(ExecuteType::Sync(0)),
                     Err(err) => {
                         error!("error flushing out buffers: {:?}", err);
-                        return Err(ExecuteError::Flush(err));
+                        Err(ExecuteError::Flush(err))
                     }
                 }
             }
@@ -235,50 +256,44 @@ impl Request {
                     return Err(ExecuteError::BadRequest(Error::InvalidParam));
                 }
                 match region.write_slice(image_id, addr) {
-                    Ok(_) => (),
+                    Ok(_) => Ok(ExecuteType::Sync(image_id.len() as u32)),
                     Err(err) => {
                         error!("error writing device ID to vring address: {:?}", err);
-                        return Err(ExecuteError::Write(err));
+                        Err(ExecuteError::Write(err))
                     }
                 }
             }
             RequestType::Unsupported(t) => {
                 error!("unsupported request");
-                return Err(ExecuteError::Unsupported(t));
+                Err(ExecuteError::Unsupported(t))
             }
-        };
-        Ok(0)
+        }
     }
 }
 
-#[derive(Clone)]
-pub struct Vring<S: StorageBackend> {
+pub struct Vring {
     mem: GuestMemoryMmap,
-    backend: S,
     queue: Queue,
     call_fd: Option<RawFd>,
     kick_fd: Option<RawFd>,
     err_fd: Option<RawFd>,
-    started: bool,
+    _started: bool,
     enabled: bool,
+    async_requests: HashMap<u32, Request>,
 }
 
-impl<S: StorageBackend> Vring<S> {
-    fn new(mem: GuestMemoryMmap, backend: S, queue: Queue) -> Self {
+impl Vring {
+    fn new(mem: GuestMemoryMmap, queue: Queue) -> Self {
         Vring {
             mem,
-            backend,
             queue,
             call_fd: None,
             kick_fd: None,
             err_fd: None,
-            started: false,
+            _started: false,
             enabled: false,
+            async_requests: HashMap::new(),
         }
-    }
-
-    fn get_queue(&self) -> &Queue {
-        &self.queue
     }
 
     fn get_queue_mut(&mut self) -> &mut Queue {
@@ -289,38 +304,82 @@ impl<S: StorageBackend> Vring<S> {
         self.kick_fd.unwrap()
     }
 
-    pub fn process_queue(&mut self) -> Result<bool> {
+    pub fn process_completions<S>(&mut self, backend: &mut S) -> Result<bool>
+    where
+        S: StorageBackend,
+    {
+        let mut count = 0;
+        loop {
+            if self.async_requests.is_empty() {
+                debug!("no pending requests");
+                return Ok(count != 0);
+            }
+
+            if let Some(cookie) = backend
+                .get_completion(false)
+                .map_err(|_err| Error::OperationFailedInSlave)?
+            {
+                let request = self.async_requests.remove(&cookie).unwrap();
+
+                debug!(
+                    "got completion with cookie: {}, desc={}",
+                    cookie, request.desc_index
+                );
+
+                let (region, addr) = self.mem.to_region_addr(request.status_addr).unwrap();
+                region.write_obj(VIRTIO_BLK_S_OK, addr).unwrap();
+                self.queue
+                    .add_used(&self.mem, request.desc_index, request.data_len);
+
+                count += 1;
+            } else {
+                return Ok(count != 0);
+            }
+        }
+    }
+
+    pub fn process_queue<S: StorageBackend>(&mut self, backend: &mut S) -> Result<bool> {
         let mut used_desc_heads = [(0, 0); 1024 as usize];
         let mut used_count = 0;
-
         for avail_desc in self.queue.iter(&self.mem) {
             debug!("got an element in the queue");
-            let len;
             match Request::parse(&avail_desc, &self.mem) {
                 Ok(request) => {
                     debug!("element is a valid request");
-
-                    let status = match request.execute(&mut self.backend, &self.mem) {
-                        Ok(l) => {
-                            len = l;
-                            VIRTIO_BLK_S_OK
-                        }
+                    let mut len = 0;
+                    match request.execute(backend, &self.mem) {
+                        Ok(type_) => match type_ {
+                            ExecuteType::Sync(l) => {
+                                debug!("executing synchronously: desc={}", request.desc_index);
+                                len = l;
+                                let (region, addr) =
+                                    self.mem.to_region_addr(request.status_addr).unwrap();
+                                region.write_obj(VIRTIO_BLK_S_OK, addr).unwrap();
+                            }
+                            ExecuteType::Async(cookie) => {
+                                debug!("executing asynchronously: desc={}", request.desc_index);
+                                self.async_requests.insert(cookie, request);
+                            }
+                        },
                         Err(err) => {
                             error!("failed to execute request: {:?}", err);
                             len = 1; // We need at least 1 byte for the status.
-                            err.status()
+                            let (region, addr) =
+                                self.mem.to_region_addr(request.status_addr).unwrap();
+                            region.write_obj(err.status(), addr).unwrap();
                         }
                     };
-                    let (region, addr) = self.mem.to_region_addr(request.status_addr).unwrap();
-                    region.write_obj(status, addr).unwrap();
+                    if len != 0 {
+                        used_desc_heads[used_count] = (avail_desc.index, len);
+                        used_count += 1;
+                    }
                 }
                 Err(err) => {
                     error!("failed to parse available descriptor chain: {:?}", err);
-                    len = 0;
+                    used_desc_heads[used_count] = (avail_desc.index, 0);
+                    used_count += 1;
                 }
             }
-            used_desc_heads[used_count] = (avail_desc.index, len);
-            used_count += 1;
         }
 
         for &(desc_index, len) in &used_desc_heads[..used_count] {
@@ -349,6 +408,12 @@ impl<S: StorageBackend> Vring<S> {
     }
 }
 
+impl Drop for Vring {
+    fn drop(&mut self) {
+        println!("dropping vring");
+    }
+}
+
 pub struct VhostUserBlk<S: StorageBackend> {
     backend: S,
     main_eventfd: EventFd,
@@ -356,7 +421,7 @@ pub struct VhostUserBlk<S: StorageBackend> {
     mem: Option<GuestMemoryMmap>,
     memory_regions: Vec<VhostUserMemoryRegion>,
     vring_num: usize,
-    vrings: HashMap<usize, Vring<S>>,
+    vrings: HashMap<usize, Arc<Mutex<Vring>>>,
     vring_default_enabled: bool,
     owned: bool,
     features_acked: bool,
@@ -387,7 +452,11 @@ impl<S: StorageBackend> VhostUserBlk<S> {
         }
     }
 
-    pub fn get_vring(&self, index: usize) -> Result<Vring<S>> {
+    pub fn set_backend(&mut self, backend: S) {
+        self.backend = backend;
+    }
+
+    pub fn get_vring(&self, index: usize) -> Result<Arc<Mutex<Vring>>> {
         let vring = match self.vrings.get(&index) {
             Some(v) => v,
             None => return Err(Error::InvalidParam),
@@ -450,7 +519,8 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         // been disabled by VHOST_USER_SET_VRING_ENABLE with parameter 0.
         let vring_enabled =
             self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0;
-        for (_vring_index, vring) in &mut self.vrings {
+        for (_vring_index, vring_mut) in &mut self.vrings {
+            let mut vring = vring_mut.lock().unwrap();
             vring.enabled = vring_enabled;
         }
         self.vring_default_enabled = true;
@@ -520,14 +590,15 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
             if !self.vrings.contains_key(&vring_index) {
                 self.vrings.insert(
                     vring_index,
-                    Vring::new(mem.clone(), self.backend.clone(), Queue::new(num as u16)),
+                    Arc::new(Mutex::new(Vring::new(mem.clone(), Queue::new(num as u16)))),
                 );
             }
         } else {
             return Err(Error::InvalidOperation);
         }
 
-        let vring = self.vrings.get_mut(&vring_index).unwrap();
+        let vring_mut = self.vrings.get(&vring_index).unwrap();
+        let mut vring = vring_mut.lock().unwrap();
         vring.enabled = self.vring_default_enabled;
         let queue = vring.get_queue_mut();
         queue.size = num as u16;
@@ -554,10 +625,11 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         let avail_ring = GuestAddress(available - region.userspace_addr);
 
         let vring_index: usize = index as usize;
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
+        let mut vring = match self.vrings.get(&vring_index) {
+            Some(v) => v.lock().unwrap(),
             None => return Err(Error::InvalidParam),
         };
+
         let queue = vring.get_queue_mut();
         queue.desc_table = desc_table;
         queue.used_ring = used_ring;
@@ -572,8 +644,8 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
             Some(m) => m,
             None => return Err(Error::InvalidParam),
         };
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
+        let mut vring = match self.vrings.get(&vring_index) {
+            Some(v) => v.lock().unwrap(),
             None => return Err(Error::InvalidParam),
         };
 
@@ -585,17 +657,10 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
 
     fn get_vring_base(&mut self, index: u32) -> Result<VhostUserVringState> {
         let vring_index: usize = index as usize;
-        let mem = match self.mem.as_ref() {
-            Some(m) => m,
-            None => return Err(Error::InvalidParam),
-        };
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
-            None => return Err(Error::InvalidParam),
-        };
 
         // Follow vhost-user spec and stop the ring
-        vring.started = false;
+        self.vrings.remove(&vring_index);
+
         self.main_sender
             .send(VubMessage::DisableVring(DisableVringMsg {
                 index: vring_index,
@@ -603,15 +668,16 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
             .unwrap();
         self.main_eventfd.write(1u64).unwrap();
 
-        let queue = vring.get_queue();
-        let last_index = queue.get_last_index(mem);
-        Ok(VhostUserVringState::new(index, last_index.into()))
+        // TODO - Should probably wait for confirmation that all vring
+        // workers have stopped
+
+        Ok(VhostUserVringState::new(index, 0))
     }
 
     fn set_vring_kick(&mut self, index: u8, fd: Option<RawFd>) -> Result<()> {
         let vring_index: usize = index as usize;
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
+        let mut vring = match self.vrings.get(&vring_index) {
+            Some(v) => v.lock().unwrap(),
             None => return Err(Error::InvalidParam),
         };
 
@@ -636,8 +702,8 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
 
     fn set_vring_call(&mut self, index: u8, fd: Option<RawFd>) -> Result<()> {
         let vring_index: usize = index as usize;
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
+        let mut vring = match self.vrings.get(&vring_index) {
+            Some(v) => v.lock().unwrap(),
             None => return Err(Error::InvalidParam),
         };
 
@@ -652,8 +718,8 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
 
     fn set_vring_err(&mut self, index: u8, fd: Option<RawFd>) -> Result<()> {
         let vring_index: usize = index as usize;
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
+        let mut vring = match self.vrings.get(&vring_index) {
+            Some(v) => v.lock().unwrap(),
             None => return Err(Error::InvalidParam),
         };
 
@@ -673,8 +739,8 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         if self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
             return Err(Error::InvalidOperation);
         }
-        let vring = match self.vrings.get_mut(&vring_index) {
-            Some(v) => v,
+        let mut vring = match self.vrings.get_mut(&vring_index) {
+            Some(v) => v.lock().unwrap(),
             None => return Err(Error::InvalidParam),
         };
 
@@ -687,18 +753,13 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         Ok(())
     }
 
-    fn get_config(
-        &mut self,
-        _payload: *const u8,
-        size: u32,
-        _flags: VhostUserConfigFlags,
-    ) -> Result<Vec<u8>> {
+    fn get_config(&mut self, buf: &[u8], _flags: VhostUserConfigFlags) -> Result<Vec<u8>> {
         // TODO - Why?
         /*if self.acked_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
             return Err(Error::InvalidOperation);
         }*/
 
-        if size != mem::size_of::<virtio_blk_config>() as u32 {
+        if buf.len() != mem::size_of::<virtio_blk_config>() {
             return Err(Error::InvalidParam);
         }
 
@@ -714,20 +775,10 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         Ok(buf.to_vec())
     }
 
-    fn set_config(
-        &mut self,
-        _payload: *const u8,
-        size: u32,
-        offset: u32,
-        _flags: VhostUserConfigFlags,
-    ) -> Result<()> {
+    fn set_config(&mut self, _buf: &[u8], offset: u32, _flags: VhostUserConfigFlags) -> Result<()> {
         if self.acked_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
             return Err(Error::InvalidOperation);
-        } else if offset < VHOST_USER_CONFIG_OFFSET
-            || offset >= VHOST_USER_CONFIG_SIZE
-            || size > VHOST_USER_CONFIG_SIZE - VHOST_USER_CONFIG_OFFSET
-            || size + offset > VHOST_USER_CONFIG_SIZE
-        {
+        } else if offset < VHOST_USER_CONFIG_OFFSET || offset >= VHOST_USER_CONFIG_SIZE {
             return Err(Error::InvalidParam);
         }
         // TODO - Implement wce change
