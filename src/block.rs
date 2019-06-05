@@ -35,6 +35,7 @@ use vhostuser_rs::{Error, Result, VhostUserSlave};
 
 bitflags! {
     pub struct VhostUserBlkFeatures: u64 {
+        const MQ = 0x1000;
         const EVENT_IDX = 0x20000000;
         const PROTOCOL_FEATURES = 0x40000000;
     }
@@ -494,7 +495,7 @@ pub struct VhostUserBlk<S: StorageBackend> {
     main_sender: Sender<VubMessage>,
     mem: Option<GuestMemoryMmap>,
     memory_regions: Vec<VhostUserMemoryRegion>,
-    vring_num: usize,
+    num_queues: u16,
     vrings: HashMap<usize, Arc<Mutex<Vring>>>,
     vring_default_enabled: bool,
     owned: bool,
@@ -508,7 +509,7 @@ impl<S: StorageBackend> VhostUserBlk<S> {
         backend: S,
         main_eventfd: EventFd,
         main_sender: Sender<VubMessage>,
-        vring_num: usize,
+        num_queues: u16,
     ) -> Self {
         VhostUserBlk {
             backend,
@@ -516,7 +517,7 @@ impl<S: StorageBackend> VhostUserBlk<S> {
             main_sender,
             mem: None,
             memory_regions: vec![],
-            vring_num,
+            num_queues,
             vrings: HashMap::new(),
             vring_default_enabled: false,
             owned: false,
@@ -656,7 +657,7 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
     }
 
     fn get_queue_num(&mut self) -> Result<u64> {
-        Ok(self.vring_num as u64)
+        Ok(self.num_queues as u64)
     }
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> Result<()> {
@@ -839,7 +840,8 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
             return Err(Error::InvalidParam);
         }
 
-        let config: virtio_blk_config = self.backend.get_config().clone();
+        let mut config: virtio_blk_config = self.backend.get_config().clone();
+        config.num_queues = self.num_queues;
 
         let buf = unsafe {
             slice::from_raw_parts(
