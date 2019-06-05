@@ -21,8 +21,10 @@ use crate::backend::StorageBackend;
 use crate::eventfd::EventFd;
 use crate::message::*;
 use crate::queue::{DescriptorChain, Queue};
+use bitflags::bitflags;
 use log::{debug, error};
 use virtio_bindings::bindings::virtio_blk::*;
+//use virtio_bindings::bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
 use vm_memory::{
     Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
     GuestRegionMmap, MmapRegion,
@@ -30,6 +32,13 @@ use vm_memory::{
 
 use vhostuser_rs::message::*;
 use vhostuser_rs::{Error, Result, VhostUserSlave};
+
+bitflags! {
+    pub struct VhostUserBlkFeatures: u64 {
+        const EVENT_IDX = 0x20000000;
+        const PROTOCOL_FEATURES = 0x40000000;
+    }
+}
 
 #[derive(Debug)]
 enum ExecuteError {
@@ -277,9 +286,12 @@ pub struct Vring {
     call_fd: Option<RawFd>,
     kick_fd: Option<RawFd>,
     err_fd: Option<RawFd>,
+    features: u64,
     _started: bool,
     enabled: bool,
     async_requests: HashMap<usize, Request>,
+    signalled_used_valid: bool,
+    signalled_used: u16,
 }
 
 impl Vring {
@@ -290,9 +302,12 @@ impl Vring {
             call_fd: None,
             kick_fd: None,
             err_fd: None,
+            features: 0,
             _started: false,
             enabled: false,
             async_requests: HashMap::new(),
+            signalled_used_valid: false,
+            signalled_used: 0,
         }
     }
 
@@ -309,6 +324,7 @@ impl Vring {
         S: StorageBackend,
     {
         let mut count = 0;
+
         loop {
             if self.async_requests.is_empty() {
                 debug!("no pending requests");
@@ -328,8 +344,16 @@ impl Vring {
 
                 let (region, addr) = self.mem.to_region_addr(request.status_addr).unwrap();
                 region.write_obj(VIRTIO_BLK_S_OK, addr).unwrap();
-                self.queue
+
+                let used_idx = self
+                    .queue
                     .add_used(&self.mem, request.desc_index, request.data_len);
+
+                if self.should_signal_guest(used_idx) {
+                    self.signal_guest().unwrap();
+                } else {
+                    debug!("omitting guest signal");
+                }
 
                 count += 1;
             }
@@ -383,7 +407,12 @@ impl Vring {
         }
 
         for &(desc_index, len) in &used_desc_heads[..used_count] {
-            self.queue.add_used(&self.mem, desc_index, len as u32);
+            let used_idx = self.queue.add_used(&self.mem, desc_index, len as u32);
+            if self.should_signal_guest(used_idx) {
+                self.signal_guest().unwrap();
+            } else {
+                debug!("omitting guest signal");
+            }
         }
 
         if backend.is_async() {
@@ -393,7 +422,48 @@ impl Vring {
         Ok(used_count > 0)
     }
 
-    pub fn signal_guest(&mut self) -> Result<()> {
+    pub fn disable_notifications(&self) {
+        if self.features & VhostUserBlkFeatures::EVENT_IDX.bits() != 0 {
+            self.queue
+                .set_avail_event(&self.mem, self.queue.get_last_avail());
+        } else {
+            // TODO
+            //self.queue.set_used_flags_bit(VRING_USED_F_NO_NOTIFY);
+        }
+    }
+
+    pub fn enable_notifications(&self) {
+        if self.features & VhostUserBlkFeatures::EVENT_IDX.bits() != 0 {
+            self.queue
+                .set_avail_event(&self.mem, self.queue.get_last_avail());
+        } else {
+            // TODO
+            //self.queue.unset_used_flags_bit(VRING_USED_F_NO_NOTIFY);
+        }
+    }
+
+    fn vring_need_signal(&mut self, new_idx: u16, old_idx: u16) -> bool {
+        let used_event = self.queue.get_used_event(&self.mem);
+        debug!("used_event={}", used_event);
+
+        if (new_idx - used_event - 1) < (new_idx - old_idx) {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_signal_guest(&mut self, used_idx: u16) -> bool {
+        let valid = self.signalled_used_valid;
+        self.signalled_used_valid = true;
+        let old = self.signalled_used;
+        self.signalled_used = used_idx;
+        let new = used_idx;
+
+        return !valid || self.vring_need_signal(new, old);
+    }
+
+    fn signal_guest(&mut self) -> Result<()> {
         debug!("signaling guest");
         let signal: u64 = 1;
         let ret = unsafe {
@@ -499,16 +569,16 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
     }
 
     fn get_features(&mut self) -> Result<u64> {
-        Ok(VhostUserVirtioFeatures::all().bits())
+        Ok(VhostUserBlkFeatures::all().bits())
     }
 
     fn set_features(&mut self, features: u64) -> Result<()> {
         if !self.owned {
             return Err(Error::InvalidOperation);
-        /*} else if self.features_acked {
-        return Err(Error::InvalidOperation);*/
-        } else if (features & VhostUserVirtioFeatures::all().bits()) != 0 {
-            return Err(Error::InvalidParam);
+            /*} else if self.features_acked {
+            return Err(Error::InvalidOperation);
+            } else if (features & VhostUserBlkFeatures::all().bits()) != 0 {
+                return Err(Error::InvalidParam);*/
         }
 
         self.acked_features = features;
@@ -522,10 +592,11 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         // VHOST_USER_SET_VRING_ENABLE with parameter 1, or after it has
         // been disabled by VHOST_USER_SET_VRING_ENABLE with parameter 0.
         let vring_enabled =
-            self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0;
+            self.acked_features & VhostUserBlkFeatures::PROTOCOL_FEATURES.bits() == 0;
         for (_vring_index, vring_mut) in &mut self.vrings {
             let mut vring = vring_mut.lock().unwrap();
             vring.enabled = vring_enabled;
+            vring.features = features;
         }
         self.vring_default_enabled = true;
 
@@ -604,6 +675,7 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         let vring_mut = self.vrings.get(&vring_index).unwrap();
         let mut vring = vring_mut.lock().unwrap();
         vring.enabled = self.vring_default_enabled;
+        vring.features = self.acked_features;
         let queue = vring.get_queue_mut();
         queue.size = num as u16;
 
@@ -740,7 +812,7 @@ impl<S: StorageBackend> VhostUserSlave for VhostUserBlk<S> {
         let vring_index: usize = index as usize;
         // This request should be handled only when VHOST_USER_F_PROTOCOL_FEATURES
         // has been negotiated.
-        if self.acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() == 0 {
+        if self.acked_features & VhostUserBlkFeatures::PROTOCOL_FEATURES.bits() == 0 {
             return Err(Error::InvalidOperation);
         }
         let mut vring = match self.vrings.get_mut(&vring_index) {

@@ -326,6 +326,18 @@ impl Queue {
         }
     }
 
+    pub fn is_empty(&mut self, mem: &GuestMemoryMmap) -> bool {
+        let avail_ring = self.avail_ring;
+        let (region, addr) = mem.to_region_addr(avail_ring).unwrap();
+        let index_addr = match region.checked_offset(addr, 2) {
+            Some(ret) => ret,
+            None => panic!("invalid avail_ring!"),
+        };
+        let last_index: u16 = region.read_obj(index_addr).unwrap();
+
+        self.next_avail.0 == last_index
+    }
+
     pub fn set_last_index(&mut self, mem: &GuestMemoryMmap, value: u16) {
         let (region, addr) = mem.to_region_addr(self.avail_ring).unwrap();
         let index_addr = match region.checked_offset(addr, 2) {
@@ -346,14 +358,35 @@ impl Queue {
         last_index
     }
 
+    pub fn get_last_avail(&self) -> u16 {
+        self.next_avail.0
+    }
+
+    pub fn get_used_event(&self, mem: &GuestMemoryMmap) -> u16 {
+        let avail_ring = self.avail_ring;
+        let used_event_addr = avail_ring.unchecked_add((4 + self.actual_size() * 2) as u64);
+        let (region, used_event_addr) = mem.to_region_addr(used_event_addr).unwrap();
+
+        let used_event: u16 = region.read_obj(used_event_addr).unwrap();
+
+        used_event
+    }
+
+    pub fn set_avail_event(&self, mem: &GuestMemoryMmap, avail_event: u16) {
+        let used_ring = self.used_ring;
+        let avail_event_addr = used_ring.unchecked_add((4 + self.actual_size() * 8) as u64);
+        let (region, avail_event_addr) = mem.to_region_addr(avail_event_addr).unwrap();
+
+        region.write_obj(avail_event, avail_event_addr).unwrap();
+    }
+
     /// Puts an available descriptor head into the used ring for use by the guest.
-    pub fn add_used(&mut self, mem: &GuestMemoryMmap, desc_index: u16, len: u32) {
+    pub fn add_used(&mut self, mem: &GuestMemoryMmap, desc_index: u16, len: u32) -> u16 {
         if desc_index >= self.actual_size() {
-            //error!(
-            //    "attempted to add out of bounds descriptor to used ring: {}",
-            //    desc_index
-            //);
-            return;
+            panic!(
+                "attempted to add out of bounds descriptor to used ring: {}",
+                desc_index
+            );
         }
 
         let used_ring = self.used_ring;
@@ -374,6 +407,8 @@ impl Queue {
         region
             .write_obj(self.next_used.0, used_ring.unchecked_add(2))
             .unwrap();
+
+        self.next_used.0
     }
 
     /// Goes back one position in the available descriptor chain offered by the driver.

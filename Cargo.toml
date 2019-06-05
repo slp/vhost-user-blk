@@ -7,13 +7,14 @@ edition = "2018"
 license = "Apache-2.0"
 
 [dependencies]
+bitflags = ">=1.0.1"
 env_logger = "0.5.12"
 epoll = ">=4.0.1"
+io-uring = "0.2"
 libc = ">=0.2.39"
 log = "0.4.6"
 nix = ">=0.12"
 
-io-uring = { path = "../io-uring" }
-virtio-bindings = { path = "../virtio-bindings" }
+virtio-bindings = { git = "https://github.com/slp/virtio-bindings" }
 vhostuser_rs = { git = "https://github.com/slp/vhostuser_rs" }
 vm-memory = { git = "https://github.com/rust-vmm/vm-memory", features = [ "backend-mmap" ] }
