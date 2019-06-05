@@ -12,11 +12,11 @@ pub trait StorageBackend: Read + Seek + Write {
 
     fn get_image_id(&self) -> &Vec<u8>;
 
-    fn is_sync(&self) -> bool;
+    fn is_async(&self) -> bool;
 
-    fn get_last_cookie(&self) -> u32;
+    fn submit_requests(&mut self) -> Result<()>;
 
-    fn get_completion(&mut self, wait: bool) -> Result<Option<u32>>;
+    fn get_completion(&mut self, wait: bool) -> Result<Option<usize>>;
 
     fn check_sector_offset(&self, sector: u64, len: u64) -> Result<()>;
 

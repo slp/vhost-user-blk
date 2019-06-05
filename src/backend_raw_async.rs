@@ -38,8 +38,7 @@ pub struct StorageBackendRawAsync {
     image: File,
     image_id: Vec<u8>,
     position: u64,
-    cookie: u32,
-    next_cookie: Wrapping<u32>,
+    next_cookie: Wrapping<usize>,
     config: virtio_blk_config,
 }
 
@@ -86,8 +85,7 @@ impl StorageBackendRawAsync {
             image,
             image_id,
             position: 0u64,
-            cookie: 0u32,
-            next_cookie: Wrapping(0u32),
+            next_cookie: Wrapping(0),
             config,
         })
     }
@@ -95,17 +93,17 @@ impl StorageBackendRawAsync {
 
 impl Read for StorageBackendRawAsync {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let cookie = self.next_cookie.0;
         self.queue
-            .submit_read(
+            .prepare_read(
                 self.image.as_raw_fd(),
                 buf,
                 self.position as i64,
-                self.next_cookie.0 as u64,
+                cookie as u64,
             )
             .unwrap();
-        self.cookie = self.next_cookie.0;
         self.next_cookie += Wrapping(1);
-        Ok(self.next_cookie.0 as usize)
+        Ok(cookie)
     }
 }
 
@@ -124,17 +122,17 @@ impl Seek for StorageBackendRawAsync {
 
 impl Write for StorageBackendRawAsync {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let cookie = self.next_cookie.0;
         self.queue
-            .submit_write(
+            .prepare_write(
                 self.image.as_raw_fd(),
                 buf,
                 self.position as i64,
-                self.next_cookie.0 as u64,
+                cookie as u64,
             )
             .unwrap();
-        self.cookie = self.next_cookie.0;
         self.next_cookie += Wrapping(1);
-        Ok(self.next_cookie.0 as usize)
+        Ok(cookie)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -170,18 +168,22 @@ impl StorageBackend for StorageBackendRawAsync {
         &self.image_id
     }
 
-    fn is_sync(&self) -> bool {
-        false
+    fn is_async(&self) -> bool {
+        true
     }
 
-    fn get_last_cookie(&self) -> u32 {
-        self.cookie
+    fn submit_requests(&mut self) -> Result<()> {
+        match self.queue.submit_requests() {
+            Ok(_) => Ok(()),
+            Err(io_uring::Error::IOError(e)) => Err(e),
+            Err(e) => panic!("Can't submit requests: {:?}", e),
+        }
     }
 
-    fn get_completion(&mut self, wait: bool) -> Result<Option<u32>> {
+    fn get_completion(&mut self, wait: bool) -> Result<Option<usize>> {
         match self.queue.get_completion(wait) {
             Ok(c) => match c {
-                Some(c) => Ok(Some(c as u32)),
+                Some(c) => Ok(Some(c as usize)),
                 None => Ok(None),
             },
             Err(io_uring::Error::IOError(e)) => Err(e),

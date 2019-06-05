@@ -133,15 +133,15 @@ impl StorageBackend for StorageBackendRaw {
         &self.image_id
     }
 
-    fn is_sync(&self) -> bool {
-        true
+    fn is_async(&self) -> bool {
+        false
     }
 
-    fn get_last_cookie(&self) -> u32 {
-        0
+    fn submit_requests(&mut self) -> Result<()> {
+        Ok(())
     }
 
-    fn get_completion(&mut self, _wait: bool) -> Result<Option<u32>> {
+    fn get_completion(&mut self, _wait: bool) -> Result<Option<usize>> {
         Ok(None)
     }
 

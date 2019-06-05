@@ -101,8 +101,8 @@ fn sector(mem: &GuestMemoryMmap, desc_addr: GuestAddress) -> result::Result<u64,
 }
 
 enum ExecuteType {
-    Sync(u32),
-    Async(u32),
+    Sync(usize),
+    Async(usize),
 }
 
 struct Request {
@@ -206,11 +206,11 @@ impl Request {
                     self.data_len, self.sector
                 );
                 match region.read_from(addr, disk, self.data_len as usize) {
-                    Ok(_) => {
-                        if disk.is_sync() {
-                            Ok(ExecuteType::Sync(self.data_len))
+                    Ok(l) => {
+                        if disk.is_async() {
+                            Ok(ExecuteType::Async(l))
                         } else {
-                            Ok(ExecuteType::Async(disk.get_last_cookie()))
+                            Ok(ExecuteType::Sync(l))
                         }
                     }
                     Err(err) => {
@@ -225,11 +225,11 @@ impl Request {
                     self.data_len, self.sector
                 );
                 match region.write_to(addr, disk, self.data_len as usize) {
-                    Ok(_) => {
-                        if disk.is_sync() {
-                            Ok(ExecuteType::Sync(self.data_len))
+                    Ok(l) => {
+                        if disk.is_async() {
+                            Ok(ExecuteType::Async(l))
                         } else {
-                            Ok(ExecuteType::Async(disk.get_last_cookie()))
+                            Ok(ExecuteType::Sync(l))
                         }
                     }
                     Err(err) => {
@@ -256,7 +256,7 @@ impl Request {
                     return Err(ExecuteError::BadRequest(Error::InvalidParam));
                 }
                 match region.write_slice(image_id, addr) {
-                    Ok(_) => Ok(ExecuteType::Sync(image_id.len() as u32)),
+                    Ok(_) => Ok(ExecuteType::Sync(image_id.len())),
                     Err(err) => {
                         error!("error writing device ID to vring address: {:?}", err);
                         Err(ExecuteError::Write(err))
@@ -279,7 +279,7 @@ pub struct Vring {
     err_fd: Option<RawFd>,
     _started: bool,
     enabled: bool,
-    async_requests: HashMap<u32, Request>,
+    async_requests: HashMap<usize, Request>,
 }
 
 impl Vring {
@@ -312,7 +312,7 @@ impl Vring {
         loop {
             if self.async_requests.is_empty() {
                 debug!("no pending requests");
-                return Ok(count != 0);
+                break;
             }
 
             if let Some(cookie) = backend
@@ -332,10 +332,10 @@ impl Vring {
                     .add_used(&self.mem, request.desc_index, request.data_len);
 
                 count += 1;
-            } else {
-                return Ok(count != 0);
             }
         }
+
+        Ok(count != 0)
     }
 
     pub fn process_queue<S: StorageBackend>(&mut self, backend: &mut S) -> Result<bool> {
@@ -383,7 +383,11 @@ impl Vring {
         }
 
         for &(desc_index, len) in &used_desc_heads[..used_count] {
-            self.queue.add_used(&self.mem, desc_index, len);
+            self.queue.add_used(&self.mem, desc_index, len as u32);
+        }
+
+        if backend.is_async() {
+            backend.submit_requests().unwrap();
         }
 
         Ok(used_count > 0)
