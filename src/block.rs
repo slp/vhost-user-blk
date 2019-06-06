@@ -326,12 +326,7 @@ impl Vring {
     {
         let mut count = 0;
 
-        loop {
-            if self.async_requests.is_empty() {
-                debug!("no pending requests");
-                break;
-            }
-
+        while !self.async_requests.is_empty() {
             if let Some(cookie) = backend
                 .get_completion(false)
                 .map_err(|_err| Error::OperationFailedInSlave)?
@@ -355,8 +350,10 @@ impl Vring {
                 } else {
                     debug!("omitting guest signal");
                 }
-
                 count += 1;
+            } else {
+                // No completions avaiable, don't waste more time looking for them.
+                break;
             }
         }
 
